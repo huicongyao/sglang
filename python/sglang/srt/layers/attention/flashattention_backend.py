@@ -144,6 +144,9 @@ class FlashAttentionBackend(AttentionBackend):
 
     needs_cpu_seq_lens: bool = False
     supports_ragged_verify_graph: bool = True
+    # Tree masks are honored by folding them into a sorted page table plus
+    # per-row cache_seqlens (two-level cascade), not by a kernel mask argument.
+    supports_tree_verify_mask: bool = True
 
     # Chunked-prefix attention reads the stable ForwardBatch cu-seqlens and
     # KV-index buffers directly, so it needs no backend-private replay state.

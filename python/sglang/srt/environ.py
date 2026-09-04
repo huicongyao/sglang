@@ -493,6 +493,13 @@ class Envs:
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
+    # PCTree (arXiv:2608.02123) parent-conditioned draft trees. When on, the
+    # verify window is the node budget N instead of gamma + 1.
+    SGLANG_DSPARK_PCTREE = EnvBool(False)
+    # PCTree offline evaluation: jsonl dump of the per-round chain and tree.
+    SGLANG_DSPARK_PCTREE_EVAL_PATH = EnvStr("")
+    SGLANG_DSPARK_PCTREE_BRANCHING = EnvStr("4")
+    SGLANG_DSPARK_PCTREE_NODE_BUDGET = EnvInt(32)
 
     # ===================================================================
     # Memory pools and KV-cache sizing

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 import msgspec
 
+from sglang.srt.environ import envs
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 
 if TYPE_CHECKING:
@@ -71,6 +72,22 @@ class DSparkRuntimeConfig(msgspec.Struct, frozen=True):
     mask_token_id: int
 
 
+def pctree_node_budget() -> Optional[int]:
+    """PCTree verification budget N, or None when tree drafting is off.
+
+    PCTree decouples the verify window from the block: the draft still runs B
+    Markov stages, but the target verifies the global top-N tree nodes.
+    """
+    if not envs.SGLANG_DSPARK_PCTREE.get():
+        return None
+    budget = int(envs.SGLANG_DSPARK_PCTREE_NODE_BUDGET.get())
+    if budget < 2:
+        raise ValueError(
+            f"SGLANG_DSPARK_PCTREE_NODE_BUDGET must be >= 2, got {budget}."
+        )
+    return budget
+
+
 def resolve_runtime_config(
     *,
     draft_hf_config: Any,
@@ -87,7 +104,26 @@ def resolve_runtime_config(
             f"markov_rank={draft_config.markov_rank}."
         )
 
-    if speculative_num_draft_tokens is None:
+    node_budget = pctree_node_budget()
+    if node_budget is not None:
+        # Under PCTree the block size must come from the checkpoint; the CLI's
+        # num_draft_tokens sizes the verify window (N) instead of gamma + 1.
+        gamma = int(draft_config.resolve_gamma(default=None) or 0)
+        if gamma < 1:
+            raise ValueError(
+                "PCTree needs the draft checkpoint's block_size to set gamma; "
+                "the draft config did not provide one."
+            )
+        if (
+            speculative_num_draft_tokens is not None
+            and int(speculative_num_draft_tokens) != node_budget
+        ):
+            raise ValueError(
+                "PCTree requires --speculative-num-draft-tokens to equal "
+                f"SGLANG_DSPARK_PCTREE_NODE_BUDGET; got "
+                f"{speculative_num_draft_tokens} vs {node_budget}."
+            )
+    elif speculative_num_draft_tokens is None:
         gamma = int(draft_config.resolve_gamma(default=None) or 0)
         if gamma < 1:
             raise ValueError(
@@ -119,7 +155,7 @@ def resolve_runtime_config(
 
     return DSparkRuntimeConfig(
         gamma=gamma,
-        verify_num_draft_tokens=gamma + 1,
+        verify_num_draft_tokens=gamma + 1 if node_budget is None else node_budget,
         mask_token_id=mask_token_id,
     )
 

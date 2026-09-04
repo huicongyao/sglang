@@ -22,6 +22,9 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
+from sglang.srt.speculative.dspark_components.dspark_pctree_eval import (
+    maybe_get_recorder,
+)
 from sglang.srt.speculative.spec_info import (
     SpeculativeAlgorithm,
     spec_scale_global_num_tokens,
@@ -78,6 +81,8 @@ class DraftProposal(msgspec.Struct, frozen=True):
     confidence: Optional[torch.Tensor] = None
     confidence_tap: Optional[torch.Tensor] = None
     folded: bool = False
+    # Only materialized on the eager path; PCTree re-scores these per parent.
+    base_logits: Optional[torch.Tensor] = None
 
 
 def make_next_draft_input(
@@ -181,6 +186,8 @@ class DraftBlockProposer:
         self._draft_block_spec_info = draft_block_spec_info
         self._draft_sampler = None
         self._dp_moe_sync = dp_moe_sync
+        # PCTree re-scores base_logits per parent, so the proposal must stay eager.
+        self._pctree_enabled = envs.SGLANG_DSPARK_PCTREE.get()
 
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
@@ -204,6 +211,9 @@ class DraftBlockProposer:
         embed_module = target_model.get_input_embeddings()
         draft_sampler = self._draft_sampler
         all_greedy = sampling_info is None or sampling_info.is_all_greedy
+        # The PCTree eval hook needs the materialized base logits, which the
+        # folded proposal keeps inside the draft graph.
+        pctree_recorder = maybe_get_recorder(block_size=self.gamma)
         fwd = self._run_forward(
             batch=batch,
             draft_input=draft_input,
@@ -219,8 +229,11 @@ class DraftBlockProposer:
         folded_confidence = None
         confidence_tap = None
         folded = False
+        base_logits = None
         if (
-            envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get()
+            pctree_recorder is None
+            and not self._pctree_enabled
+            and envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get()
             and draft_sampler is not None
             and fwd.can_run_graph
             and (all_greedy or draft_sampler.folded_sampling)
@@ -275,6 +288,16 @@ class DraftBlockProposer:
                 markov_head=self.draft_model.markov_head,
                 device=device,
             )
+            if pctree_recorder is not None:
+                pctree_recorder.record(
+                    base_logits=base_logits,
+                    anchor_tokens=draft_block_ids[:, 0],
+                    chain_tokens=draft_block.draft_tokens,
+                    prefix_lens=batch.seq_lens[:bs],
+                    req_ids=[req.rid for req in batch.reqs[:bs]],
+                    markov_head=self.draft_model.markov_head,
+                    hidden_states=fwd.draft_hidden_3d,
+                )
         return DraftProposal(
             draft_block_ids=draft_block_ids,
             draft_block=draft_block,
@@ -282,6 +305,7 @@ class DraftBlockProposer:
             confidence=folded_confidence,
             confidence_tap=confidence_tap,
             folded=folded,
+            base_logits=base_logits,
         )
 
     def run_idle_participation(self, batch: ScheduleBatch) -> None:

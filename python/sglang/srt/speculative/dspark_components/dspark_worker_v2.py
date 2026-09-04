@@ -38,7 +38,15 @@ from sglang.srt.speculative.draft_worker_common import (
 from sglang.srt.speculative.dspark_components.dspark_config import (
     DSV4_DRAFT_ATTENTION_BACKEND,
     draft_is_deepseek_v4,
+    pctree_node_budget,
     resolve_runtime_config,
+)
+from sglang.srt.speculative.dspark_components.dspark_pctree import PCTreeConfig
+from sglang.srt.speculative.dspark_components.dspark_pctree_verify import (
+    build_tree_verify_bundle,
+    commit_accept_path_kv,
+    gather_accepted_hidden,
+    tree_greedy_accept,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockProposer,
@@ -162,6 +170,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.verify_num_draft_tokens = runtime_config.verify_num_draft_tokens
         self.speculative_num_draft_tokens = self.verify_num_draft_tokens
         self._mask_token_id = runtime_config.mask_token_id
+        self._pctree = self._resolve_pctree_config()
 
         if self.ps.tp_rank == 0:
             logger.info(
@@ -305,6 +314,43 @@ class DSparkWorkerV2(BaseSpecWorker):
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
 
+    def _resolve_pctree_config(self) -> Optional[PCTreeConfig]:
+        """PCTree tree drafting config, or None when the chain path is in use.
+
+        The verify backend's tree-mask capability is checked later, once the
+        target backend exists (see init_attention_backends).
+        """
+        budget = pctree_node_budget()
+        if budget is None:
+            return None
+        if not self.server_args.disable_cuda_graph:
+            # Under graph replay the tree mask is copied into the backend's
+            # preallocated verify buffer, and the replayed metadata does not
+            # reproduce the eager tree geometry: measured output diverges from
+            # greedy within ~20 tokens while the eager path stays lossless.
+            # Fail loudly instead of serving a tree verified as a chain.
+            raise ValueError(
+                "PCTree tree verify is only correct on the eager verify path; "
+                "pass --disable-cuda-graph. (Carrying the per-step tree topology "
+                "through cuda-graph replay is not implemented.)"
+            )
+        config = PCTreeConfig(
+            block_size=self.gamma,
+            branching=int(envs.SGLANG_DSPARK_PCTREE_BRANCHING.get().split(",")[0]),
+            node_budget=budget,
+        )
+        config.validate()
+        if self.ps.tp_rank == 0:
+            logger.info(
+                "DSpark PCTree tree drafting enabled: B=%d, k=%d, N=%d "
+                "(pool bound %d).",
+                config.block_size,
+                config.branching,
+                config.node_budget,
+                config.max_pool_nodes,
+            )
+        return config
+
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
             return target_model.get_input_embeddings()
@@ -358,6 +404,20 @@ class DSparkWorkerV2(BaseSpecWorker):
             self.model_runner.attn_backend,
             "update_mamba_state_after_mtp_verify",
         )
+        if self._pctree is not None:
+            self._require_tree_mask_capable_verify_backend()
+
+    def _require_tree_mask_capable_verify_backend(self) -> None:
+        """A backend that ignores ``custom_mask`` would verify the tree as a
+        chain -- every node seeing every earlier node -- and silently accept
+        wrong tokens. Refuse to start rather than serve corrupt output."""
+        backend = self.target_worker.model_runner.attn_backend
+        if not backend.supports_tree_verify_mask:
+            raise ValueError(
+                "PCTree needs a target attention backend that reads custom_mask "
+                f"at TARGET_VERIFY; {type(backend).__name__} does not declare "
+                "supports_tree_verify_mask. Use --attention-backend triton."
+            )
 
     def init_cuda_graphs(self):
         capture_decode_cuda_graph = self._decode_graph_allowed
@@ -378,7 +438,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 # block eagerly from the graph's hidden states instead. Apart
                 # from being the intended precision fallback, skipping the
                 # unused hook avoids paying for two proposal computations.
-                if envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get():
+                if envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get() and self._pctree is None:
                     self._draft_sampler = self._maybe_build_draft_sampler()
                     if self._draft_sampler is not None:
                         self.draft_model_runner.capture_tail_hooks.append(
@@ -616,6 +676,18 @@ class DSparkWorkerV2(BaseSpecWorker):
         draft_block = proposal.draft_block
         draft_tokens = draft_block.draft_tokens
 
+        if self._pctree is not None:
+            return self._forward_decode_pctree(
+                batch=batch,
+                draft_input=draft_input,
+                proposal=proposal,
+                verify_window=verify_window,
+                bs=bs,
+                prefix_lens=prefix_lens,
+                sampling_info=sampling_info,
+                on_publish=on_publish,
+            )
+
         confidence = proposal.confidence
         if confidence is None:
             confidence = self._verify_planner.compute_confidence_tensor(
@@ -797,6 +869,162 @@ class DSparkWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
+        )
+
+    def _forward_decode_pctree(
+        self,
+        *,
+        batch: ScheduleBatch,
+        draft_input: DFlashDraftInputV2,
+        proposal,
+        verify_window,
+        bs: int,
+        prefix_lens: torch.Tensor,
+        sampling_info,
+        on_publish,
+    ) -> GenerationBatchResult:
+        """Tree-drafting decode step: build the tree, verify it, commit the path.
+
+        Confidence scheduling is bypassed (as in the PCTree paper): the verify
+        window is the fixed node budget N, so there is no per-step truncation to
+        schedule.
+        """
+        if proposal.base_logits is None:
+            raise RuntimeError(
+                "PCTree needs the eager proposal's base_logits; the folded "
+                "proposal path should have been disabled."
+            )
+        if batch.has_grammar:
+            raise NotImplementedError(
+                "PCTree tree verify does not yet build a grammar tree; the chain "
+                "path's GrammarTree.from_linear_chain does not describe a tree."
+            )
+        bundle = build_tree_verify_bundle(
+            base_logits=proposal.base_logits,
+            anchor_tokens=proposal.draft_block_ids[:, 0],
+            markov_head=self.draft_model.markov_head,
+            hidden_states=proposal.draft_hidden,
+            config=self._pctree,
+            prefix_lens=prefix_lens,
+            # One D2H per step: the flat FULL_MASK layout is ragged in the prefix
+            # length, so its per-request extents must be known on the host. A
+            # production path would scatter the mask with GPU-side offsets
+            # (as triton's own mask_indptr already does) instead.
+            prefix_lens_cpu=prefix_lens.tolist(),
+        )
+
+        prepare_mamba_track_for_verify(batch)
+        with self._observers.segment(InfoSegment.TARGET_VERIFY):
+            target_verify = self._verify_executor.run_tree(
+                batch=batch,
+                draft_input=draft_input,
+                bundle=bundle,
+                verify_window=verify_window,
+                sampling_info=sampling_info,
+            )
+        logits_output = target_verify.logits_output
+
+        accept = tree_greedy_accept(
+            tree=bundle.tree,
+            target_logits=logits_output.next_token_logits,
+            max_depth=self.gamma,
+        )
+        commit_lens = (accept.correct_len + 1).to(torch.int32)
+        new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+
+        # Re-index the verify outputs into accepted-path order. Downstream
+        # consumers (logprobs, hidden commit) then see a chain of stride N and
+        # need no tree awareness.
+        stride = self.verify_num_draft_tokens
+        logits_output.next_token_logits = gather_accepted_hidden(
+            hidden=logits_output.next_token_logits.view(bs, stride, -1),
+            accept_cols=accept.accept_cols,
+        ).reshape(bs * stride, -1)
+
+        commit_accept_path_kv(
+            req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+            req_pool_indices=batch.req_pool_indices[:bs],
+            prefix_lens=prefix_lens,
+            accept_cols=accept.accept_cols,
+            correct_len=accept.correct_len,
+            max_depth=self.gamma,
+        )
+        self._commit_pctree_hidden(
+            logits_output=logits_output,
+            verify_window=verify_window,
+            accept_cols=accept.accept_cols,
+            commit_lens=commit_lens,
+            prefix_lens=prefix_lens,
+            bs=bs,
+        )
+        if batch.return_logprob:
+            compute_spec_logprobs(
+                batch,
+                logits_output,
+                accept.out_tokens.reshape(-1),
+                chain_stride=stride,
+            )
+        logits_output.hidden_states = None
+
+        if on_publish is not None:
+            on_publish(new_seq_lens)
+        self._commit_target_mamba_states_after_verify(
+            batch=batch,
+            seq_lens_pre_verify=prefix_lens,
+            seq_lens_post_verify=new_seq_lens,
+            commit_lens=commit_lens,
+        )
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=accept.out_tokens.reshape(-1),
+            accept_lens=commit_lens,
+            block_accept_lens=commit_lens,
+            cap_lens=None,
+            can_run_cuda_graph=target_verify.can_run_cuda_graph,
+            next_draft_input=make_next_draft_input(
+                bonus_tokens=accept.bonus,
+                new_seq_lens=new_seq_lens,
+            ),
+            speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
+            new_seq_lens=new_seq_lens,
+        )
+
+    def _commit_pctree_hidden(
+        self,
+        *,
+        logits_output,
+        verify_window,
+        accept_cols: torch.Tensor,
+        commit_lens: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        bs: int,
+    ) -> None:
+        """Inject the accepted path's target hidden states into the draft KV.
+
+        Both the hidden states and the KV slots are reordered by ``accept_cols``,
+        so the existing ``col < commit_lens`` gate keeps addressing position
+        prefix + col exactly as it does on the chain path.
+        """
+        hidden = logits_output.hidden_states
+        if hidden is None:
+            raise RuntimeError("PCTree verify requires target hidden states, got None.")
+        stride = self.verify_num_draft_tokens
+        path_hidden = gather_accepted_hidden(
+            hidden=hidden.view(bs, stride, -1), accept_cols=accept_cols
+        )
+        path_cache_loc_2d = torch.gather(
+            verify_window.verify_cache_loc_2d, 1, accept_cols
+        )
+        positions = prefix_lens.view(-1, 1) + self._block_pos_offsets[:stride].view(
+            1, -1
+        )
+        self._verify_executor.kv_injector.inject_target_hidden(
+            target_hidden=path_hidden.reshape(-1, path_hidden.shape[-1]),
+            cache_loc=path_cache_loc_2d.reshape(-1),
+            cache_loc_2d=path_cache_loc_2d,
+            positions=positions.reshape(-1),
+            commit_lens=commit_lens,
+            state_slot=None,
         )
 
     def _commit_target_mamba_states_after_verify(

@@ -276,6 +276,57 @@ class TargetVerifyExecutor:
 
         return result
 
+    def run_tree(
+        self,
+        *,
+        batch: ScheduleBatch,
+        draft_input: DFlashDraftInputV2,
+        bundle,
+        verify_window: VerifyWindow,
+        sampling_info,
+    ) -> TargetVerifyResult:
+        """PCTree verify: one target forward over the N packed tree nodes.
+
+        Differs from ``run_non_compact`` only in what the spec input carries --
+        tree positions (depth + prefix) and the ancestor-only ``custom_mask``.
+        Backends that ignore ``custom_mask`` would silently verify the tree as a
+        chain, so the caller must have checked the backend reads it.
+        """
+        verify_w = self.verify_num_draft_tokens
+        verify_input = DFlashVerifyInput(
+            draft_token=bundle.verify_ids,
+            positions=bundle.positions,
+            draft_token_num=verify_w,
+            topk=2,  # any value > 1; gates tree metadata in backends that check
+            custom_mask=bundle.custom_mask,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            live_seq_lens_cpu=batch.seq_lens_cpu,
+        )
+        batch.out_cache_loc = verify_window.verify_cache_loc
+        seq_lens_cpu_backup = batch.seq_lens_cpu
+        seq_lens_sum_backup = batch.seq_lens_sum
+        if not self._verify_backend_self_adds_seq_lens():
+            if seq_lens_cpu_backup is not None:
+                batch.seq_lens_cpu = seq_lens_cpu_backup + verify_w
+                batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            elif draft_input.nxt_kv_lens_cpu is not None:
+                batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
+                batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
+
+        result = self._forward_prepared_verify(
+            batch=batch,
+            verify_input=verify_input,
+            seq_lens_cpu_backup=seq_lens_cpu_backup,
+            seq_lens_sum_backup=seq_lens_sum_backup,
+        )
+        if sampling_info is not None:
+            apply_dflash_verify_logits_adjustments(
+                next_token_logits=result.logits_output.next_token_logits,
+                sampling_info=sampling_info,
+                draft_token_num=verify_w,
+            )
+        return result
+
     def _forward_prepared_verify(
         self,
         *,

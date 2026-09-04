@@ -62,6 +62,13 @@ class AttentionBackend(ABC):
 
     supports_ragged_verify_graph: bool = False
 
+    # Whether TARGET_VERIFY consumes ``spec_info.custom_mask``. A backend that
+    # leaves this False would verify a tree draft as if it were a chain -- every
+    # node attending to every earlier node -- and silently accept wrong tokens,
+    # so tree-drafting algorithms must gate on it. Distinct from ``verify_mask``,
+    # which only reports a preallocated cuda-graph buffer.
+    supports_tree_verify_mask: bool = False
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
 

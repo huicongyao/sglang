@@ -289,6 +289,9 @@ def fast_prefill_plan(
 class FlashInferAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
+    # The prefill wrapper plans with custom_mask_buf/mask_indptr_buf.
+    supports_tree_verify_mask: bool = True
+
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.
     extend_dummy_seqs_capped_by_req_pool: bool = True

@@ -359,6 +359,10 @@ def _handle_dspark(server_args: ServerArgs) -> None:
         server_args.speculative_eagle_topk = 1
 
     gamma: Optional[int] = None
+    from sglang.srt.speculative.dspark_components.dspark_config import (
+        pctree_node_budget,
+    )
+
     if server_args.speculative_dspark_block_size is not None:
         if int(server_args.speculative_dspark_block_size) <= 0:
             raise ValueError(
@@ -389,14 +393,24 @@ def _handle_dspark(server_args: ServerArgs) -> None:
 
     if gamma is not None:
         verify_window = int(gamma) + 1
+        pctree_budget = pctree_node_budget()
+        if pctree_budget is not None:
+            # PCTree verifies the top-N tree nodes, not a gamma + 1 chain, so the
+            # verify window is decoupled from the block size here.
+            verify_window = pctree_budget
         if (
             server_args.speculative_num_draft_tokens is not None
             and int(server_args.speculative_num_draft_tokens) != verify_window
         ):
+            expected = (
+                f"the PCTree node budget (= {verify_window})"
+                if pctree_budget is not None
+                else f"gamma + 1 (= {verify_window} for gamma={gamma})"
+            )
             raise ValueError(
-                "DSpark speculative_num_draft_tokens must equal gamma + 1 "
-                f"(= {verify_window} for gamma={gamma}), but got "
-                f"speculative_num_draft_tokens={server_args.speculative_num_draft_tokens}."
+                f"DSpark speculative_num_draft_tokens must equal {expected}, but "
+                f"got speculative_num_draft_tokens="
+                f"{server_args.speculative_num_draft_tokens}."
             )
         server_args.speculative_num_draft_tokens = verify_window
 
